@@ -4,81 +4,82 @@
 
 __global__
 void forward_kernel(const float* Q, const float* K, const float* V, const int N, const int d,
-                    const int Tc, const int Tr, const int Bc, const int Br, float* O) {
+                              const int Tc, const int Tr, const int Bc, const int Br, float* O) {
     int tx = threadIdx.x;
     int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
 
     // Offset into Q,K,V,O - different for each batch and head
-    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
+    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);
 
-    // Define SRAM for Q,K,V,S
-    extern __shared__ float sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
-    float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S = &sram[tile_size * 3];
+    // Define shared memory for Q,K,V tiles
+    extern __shared__ float shared_mem[];
+    float* Qi = shared_mem;
+    float* Kj = Qi + (Bc * d);
+    float* Vj = Kj + (Bc * d);
 
-    for (int j = 0; j < Tc; j++) {
-        // Load Kj, Vj to SRAM
-        for (int x = 0; x < d; x++) {
-            Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
-            Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+    for (int j = 0; j < Tc; ++j) {
+        // Load K, V tiles into shared memory
+        int global_kv_idx = qkv_offset + (j * Bc * d) + tx;
+        if(tx < d) { // Ensure we do not read out of bounds
+            Kj[tx] = K[global_kv_idx];
+            Vj[tx] = V[global_kv_idx];
         }
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        __syncthreads();
 
-        for (int i = 0; i < Tr; i++)  {
-            // Load Qi to SRAM
-            for (int x = 0; x < d; x++) {
-                Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
+        for (int i = 0; i < Tr; ++i) {
+            // Load Q tile into shared memory
+            int global_q_idx = qkv_offset + (i * Br * d) + tx;
+            if(tx < d) { // Ensure we do not read out of bounds
+                Qi[tx] = Q[global_q_idx];
             }
 
-            // S = QK^T and then apply element-wise e^(S - 7)
-            for (int y = 0; y < Bc; y++) {
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                }
-                S[(Bc * tx) + y] = __expf(sum - 7);
+            // Compute dot product and apply e^(x-7) operation
+            float sum = 0.0f;
+            for (int k = 0; k < d; ++k) {
+                sum += Qi[k] * Kj[k];
+            }
+            sum = __expf(sum - 7);
+
+            // Accumulate the result with V and write back
+            float result = 0.0f;
+            for (int k = 0; k < d; ++k) {
+                result += sum * Vj[k];
             }
 
-            // Compute and write O to HBM
-            for (int x = 0; x < d; x++) {
-                float pv = 0;  // accumulator for the dot product of Pij and Vj
-                for (int y = 0; y < Bc; y++) {
-                    pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-                }
-                O[qkv_offset + (tile_size * i) + (tx * d) + x] = pv;
+            if(tx < d) { // Ensure we do not write out of bounds
+                O[global_q_idx] = result;
             }
         }
-        __syncthreads();  // otherwise, threads can use the wrong Kj, Vj in inner loop
+        __syncthreads();
     }
 }
 
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    // Determine Bc, Br dynamically or set as fixed values
-    const int Bc = 32; const int Br = 32;
+    const int Bc = 32; // Block size for columns
+    const int Br = 32; // Block size for rows
 
-    const int B = Q.size(0); const int nh = Q.size(1);
-    const int N = Q.size(2); const int d = Q.size(3);
+    const int B = Q.size(0); // Batch size
+    const int nh = Q.size(1); // Number of heads
+    const int N = Q.size(2); // Sequence length
+    const int d = Q.size(3); // Feature dimension
 
-    const int Tc = ceil((float) N / Bc); const int Tr = ceil((float) N / Br);
+    const int Tc = (N + Bc - 1) / Bc; // Tiles along columns
+    const int Tr = (N + Br - 1) / Br; // Tiles along rows
 
-    // Initialize O to HBM
-    auto O = torch::zeros_like(Q);
-    torch::Device device(torch::kCUDA);
-    O = O.to(device);
+    auto options = torch::TensorOptions().device(torch::kCUDA);
+    auto O = torch::empty_like(Q, options);
 
-    // Calculate SRAM size needed per block
-    const int sram_size = (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
+    dim3 grid(B, nh);
+    dim3 block(std::min(N, Bc));
 
-    dim3 grid_dim(B, nh);  // batch_size x num_heads
-    dim3 block_dim(Bc);  // Bc threads per block
+    // Shared memory size calculation needs to account for Q, K, and V tiles
+    size_t shared_mem_size = 3 * Bc * d * sizeof(float);
 
-    forward_kernel<<<grid_dim, block_dim, sram_size>>>(
+    forward_kernel<<<grid, block, shared_mem_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
         N, d, Tc, Tr, Bc, Br, O.data_ptr<float>()
     );
+
     return O;
 }
 
