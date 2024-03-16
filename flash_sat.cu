@@ -39,13 +39,14 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
                 sum += Qi[k] * Kj[k];
             }
 
-            // Apply condition: if sum < 0 then sum = 0
-            sum = max(sum, 0.0f);
+            // Clamp to prevent overflow in exp, then apply e^(x-7) operation
+            float clamped_sum = min(sum - 7, 88.7f);
+            float exp_result = __expf(clamped_sum);
 
             // Accumulate the result with V and write back
             float result = 0.0f;
             for (int k = 0; k < d; ++k) {
-                result += sum * Vj[k];
+                result += exp_result * Vj[k];
             }
 
             if(tx < d) { // Ensure we do not write out of bounds
@@ -55,7 +56,6 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
         __syncthreads();
     }
 }
-
 
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     const int Bc = 32; // Block size for columns
