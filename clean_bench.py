@@ -3,6 +3,11 @@ import torch
 from torch.nn import functional as F
 from torch.nn import ReLU
 from torch.utils.cpp_extension import load
+from rich.console import Console
+from rich.syntax import Syntax
+
+# Create a console object for rich print
+console = Console()
 
 # Function to load the custom CUDA kernels as Python modules
 def load_custom_kernels():
@@ -55,10 +60,11 @@ attention_mechanisms = {
 
 # Profile each attention mechanism
 for name, func in attention_mechanisms.items():
-    print(f'=== Profiling {name} ===')
+    console.print(f'=== Profiling {name} ===', style="bold green")
     q, k, v = initialize_inputs()  # Reset and initialize inputs
     with torch.autograd.profiler.profile(use_cuda=True) as prof:
         result = func(q, k, v)
-    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
-    print('--------------------------------------------')
+    profile_result = Syntax(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10), "python", theme="monokai", line_numbers=True)
+    console.print(profile_result)
+    console.print('--------------------------------------------', style="bold red")
 
