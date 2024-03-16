@@ -1,0 +1,7 @@
+
+We can detect whether or not the input will saturate, and if so simply set to the maximum value.
+This actually decreases processing time since it's a lookup table
+
+ReLU is likewise very simple to implement.
+
+PolyMax typically gets better values than the 
